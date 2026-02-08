@@ -1,0 +1,19 @@
+name: Start NIFTY Bot Daily
+
+on:
+  schedule:
+    # Runs at 9:15 AM IST (3:45 AM UTC) Monday to Friday
+    - cron: '45 3 * * 1-5'
+  workflow_dispatch: # Manual trigger for testing
+
+jobs:
+  restart-railway:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Railway Redeploy
+        run: |
+          curl -X POST "https://backboard.railway.app/graphql/v2" \
+            -H "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"query": "mutation { serviceInstanceRedeploy(serviceId: \"${{ secrets.RAILWAY_SERVICE_ID }}\") }"}'
+          echo "✅ Railway redeploy triggered"
