@@ -194,10 +194,14 @@ class DhanTokenManager:
         print("🔄 Attempting to renew Dhan API token...")
 
         try:
-            response = requests.post(
+            renew_headers = {
+                "Accept": "application/json",
+                "access-token": self._access_token,
+                "dhanClientId": self._client_id,
+            }
+            response = requests.get(
                 RENEW_TOKEN_URL,
-                headers=self.get_headers(),
-                json={},  # Empty body
+                headers=renew_headers,
                 timeout=10
             )
 
