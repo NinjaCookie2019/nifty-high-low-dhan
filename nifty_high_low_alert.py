@@ -14,6 +14,7 @@ import pytz
 
 # Import token manager for automatic token renewal
 from token_manager import DhanTokenManager
+from railway_variable_client import RailwayVariableClient
 
 # Load environment variables
 load_dotenv()
@@ -23,6 +24,13 @@ DHAN_API_TOKEN = os.getenv("DHAN_API_TOKEN")
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+RAILWAY_API_TOKEN = os.getenv("RAILWAY_API_TOKEN")
+RAILWAY_PROJECT_ID = os.getenv("RAILWAY_PROJECT_ID")
+RAILWAY_ENVIRONMENT_ID = os.getenv("RAILWAY_ENVIRONMENT_ID")
+RAILWAY_SERVICE_ID = os.getenv("RAILWAY_SERVICE_ID")
+FORCE_TOKEN_RENEW_ON_START = os.getenv("FORCE_TOKEN_RENEW_ON_START", "false").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 # Indian timezone
 IST = pytz.timezone('Asia/Kolkata')
@@ -131,6 +139,37 @@ def send_telegram_message(message: str) -> bool:
     except Exception as e:
         print(f"❌ Error sending Telegram message: {e}")
         return False
+
+
+def get_missing_railway_persistence_vars() -> list:
+    """Get list of Railway env vars required for token persistence."""
+    required = {
+        "RAILWAY_API_TOKEN": RAILWAY_API_TOKEN,
+        "RAILWAY_PROJECT_ID": RAILWAY_PROJECT_ID,
+        "RAILWAY_ENVIRONMENT_ID": RAILWAY_ENVIRONMENT_ID,
+        "RAILWAY_SERVICE_ID": RAILWAY_SERVICE_ID,
+    }
+    return [name for name, value in required.items() if not value]
+
+
+def is_railway_persistence_enabled() -> bool:
+    """Check if Railway token persistence is fully configured."""
+    return len(get_missing_railway_persistence_vars()) == 0
+
+
+def persist_token_to_railway(new_token: str) -> tuple:
+    """Persist renewed DHAN_API_TOKEN into Railway service variables."""
+    missing_vars = get_missing_railway_persistence_vars()
+    if missing_vars:
+        return False, f"Missing Railway env vars: {', '.join(missing_vars)}"
+
+    client = RailwayVariableClient(
+        api_token=RAILWAY_API_TOKEN,
+        project_id=RAILWAY_PROJECT_ID,
+        environment_id=RAILWAY_ENVIRONMENT_ID,
+        service_id=RAILWAY_SERVICE_ID,
+    )
+    return client.upsert_service_variable("DHAN_API_TOKEN", new_token)
 
 
 def get_previous_day_high_low() -> tuple:
@@ -286,24 +325,6 @@ def check_breakout(current_price: float, prev_high: float, prev_low: float, stat
         state.low_broken = True
 
 
-def is_market_open() -> bool:
-    """
-    Check if Indian stock market is open
-    Market hours: 9:15 AM - 3:30 PM IST, Monday to Friday
-    """
-    now = datetime.now(IST)
-    
-    # Check if it's a weekday
-    if now.weekday() >= 5:
-        return False
-    
-    # Market hours (9:15 AM to 3:30 PM)
-    market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    
-    return market_open <= now <= market_close
-
-
 def is_within_trading_window() -> bool:
     """
     Check if we're within the trading window (9:15 AM - 3:30 PM IST)
@@ -334,18 +355,6 @@ def run_monitor(check_interval: int = 5) -> None:
     current_time = datetime.now(IST)
     print(f"🕐 Current IST Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # Check if within trading window - EXIT if outside (saves Railway hours)
-    if not is_within_trading_window():
-        print(f"\n⏰ Outside trading hours (9:15 AM - 3:30 PM IST, Mon-Fri)")
-        print(f"📅 Today is: {current_time.strftime('%A')}")
-        print("🛑 Exiting to save resources. Will restart at next scheduled time.")
-        send_telegram_message(
-            f"🔴 <b>Bot Stopped</b>\n\n"
-            f"Outside trading hours.\n"
-            f"Current time: {current_time.strftime('%Y-%m-%d %H:%M:%S')} IST"
-        )
-        sys.exit(0)
-    
     # Validate configuration
     if not all([DHAN_API_TOKEN, DHAN_CLIENT_ID, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
         print("❌ Missing required environment variables!")
@@ -355,38 +364,67 @@ def run_monitor(check_interval: int = 5) -> None:
         print("  - TELEGRAM_BOT_TOKEN")
         print("  - TELEGRAM_CHAT_ID")
         return
-    
+
+    if is_railway_persistence_enabled():
+        print("✅ Railway token persistence is enabled.")
+    else:
+        missing_vars = get_missing_railway_persistence_vars()
+        print("⚠️ Railway token persistence is disabled.")
+        print(f"   Missing env vars: {', '.join(missing_vars)}")
+        print("   Bot will run, but post-restart token may require manual update.")
+
     # Initialize Token Manager with Telegram notification capability
     global token_manager
     token_manager = DhanTokenManager(
         access_token=DHAN_API_TOKEN,
         client_id=DHAN_CLIENT_ID,
         telegram_notify_func=send_telegram_message,
-        renewal_threshold_hours=2.0  # Renew 2 hours before expiry
+        renewal_threshold_hours=2.0,  # Renew 2 hours before expiry
+        persist_token_func=persist_token_to_railway if is_railway_persistence_enabled() else None,
     )
     
     # Validate Dhan token
     print("\n🔐 Validating Dhan API token...")
     if not validate_dhan_token():
         return
-    
+
+    # Optional manual test switch: force token renewal immediately on startup.
+    # Useful to verify end-to-end renewal + Railway persistence without waiting.
+    if FORCE_TOKEN_RENEW_ON_START:
+        print("🧪 FORCE_TOKEN_RENEW_ON_START is enabled. Forcing renewal now...")
+        send_telegram_message(
+            "🧪 <b>Forced Token Renewal Test</b>\n\n"
+            "Triggering immediate renewal on startup for verification."
+        )
+        renew_ok, renew_error = token_manager.renew_token()
+        if not renew_ok and token_manager.is_token_expired():
+            print("🛑 Forced renewal failed and token is expired. Stopping bot.")
+            send_telegram_message(
+                "🛑 <b>Bot Stopped - Forced Renewal Failed</b>\n\n"
+                "Token is expired and forced renewal failed.\n"
+                "Please verify Dhan token and Railway configuration."
+            )
+            sys.exit(1)
+        if not renew_ok:
+            print(f"⚠️ Forced renewal failed but token still valid: {renew_error}")
+
     state = BreakoutState()
     last_token_check = datetime.now(IST)
     last_date = None
+    was_in_trading_window = False
     
     while True:
         try:
-            # Exit if market window has closed
-            if not is_within_trading_window():
-                print("\n🛑 Market closed. Exiting bot to save resources.")
-                send_telegram_message(
-                    f"🔴 <b>Bot Stopped - Market Closed</b>\n\n"
-                    f"Time: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')} IST\n"
-                    f"Will restart tomorrow at 9:00 AM IST"
-                )
-                sys.exit(0)
-            
-            current_date = datetime.now(IST).date()
+            now = datetime.now(IST)
+            current_date = now.date()
+            in_trading_window = is_within_trading_window()
+
+            # Log window transitions for clarity without noisy logs.
+            if in_trading_window and not was_in_trading_window:
+                print(f"🟢 Entered trading window at {now.strftime('%Y-%m-%d %H:%M:%S')} IST")
+            elif not in_trading_window and was_in_trading_window:
+                print(f"🟡 Exited trading window at {now.strftime('%Y-%m-%d %H:%M:%S')} IST")
+            was_in_trading_window = in_trading_window
             
             # Reset state at the start of each new day
             if last_date != current_date:
@@ -398,7 +436,31 @@ def run_monitor(check_interval: int = 5) -> None:
                 state.previous_low = None
                 last_date = current_date
                 print(f"\n📅 New trading day: {current_date}")
+
+            # Periodic token renewal check (every 30 minutes) even outside trading hours
+            if (now - last_token_check).total_seconds() >= 1800:  # 30 minutes
+                last_token_check = now
+                if token_manager and token_manager.should_renew():
+                    print("🔄 Token renewal check triggered...")
+                    if not token_manager.check_and_renew_if_needed():
+                        print("🛑 Token expired and renewal failed. Stopping bot.")
+                        send_telegram_message(
+                            "🛑 <b>Bot Stopped - Dhan Token Expired</b>\n\n"
+                            "Renewal failed after token expiry.\n"
+                            "Please verify Dhan token and Railway persistence configuration."
+                        )
+                        sys.exit(1)
+                else:
+                    # Log token status periodically
+                    time_remaining = token_manager.get_time_until_expiry() if token_manager else None
+                    if time_remaining:
+                        print(f"🔑 Token status: {time_remaining} until expiry")
             
+            # Keep process alive 24x7, but skip market data checks outside the trading window.
+            if not in_trading_window:
+                time.sleep(60)
+                continue
+
             # Fetch previous day high/low if not already fetched
             if state.previous_high is None or state.previous_low is None:
                 prev_high, prev_low = get_previous_day_high_low()
@@ -420,26 +482,6 @@ def run_monitor(check_interval: int = 5) -> None:
                     print("⏳ Waiting to fetch previous day data...")
                     time.sleep(60)  # Wait 1 minute before retry
                     continue
-            
-            # Check if market is open
-            if not is_market_open():
-                print(f"⏸️  Market closed. Waiting... (Time: {datetime.now().strftime('%H:%M:%S')})")
-                time.sleep(60)  # Check every minute when market is closed
-                continue
-            
-            # Periodic token renewal check (every 30 minutes)
-            now = datetime.now(IST)
-            if (now - last_token_check).total_seconds() >= 1800:  # 30 minutes
-                last_token_check = now
-                if token_manager and token_manager.should_renew():
-                    print("🔄 Token renewal check triggered...")
-                    if not token_manager.check_and_renew_if_needed():
-                        print("⚠️ Token renewal failed - will retry later")
-                else:
-                    # Log token status periodically
-                    time_remaining = token_manager.get_time_until_expiry() if token_manager else None
-                    if time_remaining:
-                        print(f"🔑 Token status: {time_remaining} until expiry")
             
             # Get current LTP
             current_price = get_current_ltp()
