@@ -207,7 +207,11 @@ class DhanTokenManager:
 
             if response.status_code == 200:
                 data = response.json()
-                new_token = data.get('accessToken') or data.get('access_token')
+                new_token = (
+                    data.get('accessToken')
+                    or data.get('access_token')
+                    or data.get('token')
+                )
 
                 if new_token:
                     old_token_prefix = self._access_token[:10] if self._access_token else "N/A"
@@ -240,7 +244,8 @@ class DhanTokenManager:
                         validation_error or "New token validation failed"
                     )
                 else:
-                    error_msg = f"No token in renewal response: {data}"
+                    safe_payload = self._sanitize_payload(data)
+                    error_msg = f"No token in renewal response: {safe_payload}"
                     return self._handle_renewal_failure(error_msg)
             else:
                 error_msg = f"Token renewal failed: {response.status_code} - {response.text}"
@@ -249,6 +254,21 @@ class DhanTokenManager:
         except Exception as e:
             error_msg = f"Error renewing token: {e}"
             return self._handle_renewal_failure(error_msg)
+
+    def _sanitize_payload(self, payload: dict) -> dict:
+        """Remove sensitive token-like values before logging or notifications."""
+        if not isinstance(payload, dict):
+            return {"value": str(payload)}
+
+        safe_payload = {}
+        for key, value in payload.items():
+            lowered = str(key).lower()
+            if "token" in lowered:
+                token_value = str(value) if value is not None else ""
+                safe_payload[key] = f"{token_value[:10]}..." if token_value else "REDACTED"
+            else:
+                safe_payload[key] = value
+        return safe_payload
 
     def _persist_renewed_token(self, new_token: str) -> Tuple[Optional[bool], Optional[str]]:
         """Persist renewed token using configured callback, if available."""
