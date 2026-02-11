@@ -41,8 +41,8 @@ class RailwayVariableClient:
             (True, None) on success, otherwise (False, error_message)
         """
         mutation = """
-        mutation UpsertServiceVariables($input: VariableCollectionUpsertInput!) {
-          variableCollectionUpsert(input: $input)
+        mutation VariableUpsert($input: VariableUpsertInput!) {
+          variableUpsert(input: $input)
         }
         """
 
@@ -53,8 +53,8 @@ class RailwayVariableClient:
                     "projectId": self._project_id,
                     "environmentId": self._environment_id,
                     "serviceId": self._service_id,
-                    "replace": False,
-                    "variables": [{"name": name, "value": value}],
+                    "name": name,
+                    "value": value,
                 }
             },
         }
@@ -79,10 +79,13 @@ class RailwayVariableClient:
 
         errors = body.get("errors") or []
         if errors:
-            joined = "; ".join(err.get("message", str(err)) for err in errors)
+            joined = "; ".join(
+                f"{err.get('message', str(err))} (path={err.get('path')})"
+                for err in errors
+            )
             return False, f"Railway GraphQL error: {joined}"
 
-        upsert_result = body.get("data", {}).get("variableCollectionUpsert")
+        upsert_result = body.get("data", {}).get("variableUpsert")
         if upsert_result is None:
             return False, f"Unexpected Railway response shape: {body}"
         if isinstance(upsert_result, bool) and not upsert_result:
