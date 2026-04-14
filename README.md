@@ -9,6 +9,8 @@ A Python script that monitors NIFTY 50 index and sends Telegram alerts when the 
 - 🔔 Sends Telegram alerts when high/low is broken
 - 🕐 Automatically detects market hours (9:15 AM - 3:30 PM IST)
 - 📅 Resets alerts at the start of each trading day
+- ♻️ Restores same-day alert state after a restart to avoid duplicate breakout alerts
+- ⏳ Defers Railway token persistence until after market hours to avoid mid-session restarts
 - ⚡ Configurable check interval
 
 ## Prerequisites
@@ -50,11 +52,13 @@ FORCE_TOKEN_RENEW_ON_START=false
 If Railway variables above are configured, the bot will automatically:
 
 1. Renew `DHAN_API_TOKEN` before expiry.
-2. Update Railway service variable `DHAN_API_TOKEN` using Railway GraphQL API.
-3. Continue running even if persistence fails (in-memory token remains active for current process).
-4. Send Telegram warnings for renewal/persistence failures and a critical alert if token expires.
+2. Keep the renewed token active in memory immediately.
+3. Defer updating Railway service variable `DHAN_API_TOKEN` until after market hours, so Railway does not restart the worker mid-session.
+4. Continue running even if persistence fails (in-memory token remains active for current process).
+5. Restore same-day alert flags on restart so startup/high/low alerts are not duplicated.
+6. Send Telegram warnings for renewal/persistence failures and a critical alert if token expires.
 
-This ensures the next scheduled Railway restart starts with the latest token, without manual updates.
+This ensures Railway gets the latest token without interrupting live market monitoring.
 
 Security guidance:
 - Use a scoped Railway API token with minimum required permissions.
@@ -105,8 +109,10 @@ python nifty_high_low_alert.py
 1. **Runs continuously (24x7)**: Process stays alive on Railway.
 2. **Outside market hours**: Bot sleeps and only performs periodic token health checks.
 3. **During market hours**: Checks NIFTY LTP every 5 seconds (configurable).
-4. **On breakout**: Sends Telegram alert (once per day per breakout type).
-5. **New day**: Resets state and fetches new previous day data.
+4. **On token renewal during market hours**: Keeps monitoring with the new token, but waits until after market close before updating Railway.
+5. **On restart**: Reloads saved same-day alert state and reconciles current price so it does not resend old breakout alerts.
+6. **On breakout**: Sends Telegram alert once per day per breakout type.
+7. **New day**: Resets state and fetches new previous day data.
 
 ## Sample Alerts
 

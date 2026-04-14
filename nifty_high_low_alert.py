@@ -8,7 +8,9 @@ import os
 import sys
 import requests
 import time
+import json
 from datetime import datetime, timedelta
+from pathlib import Path
 from dotenv import load_dotenv
 import pytz
 
@@ -48,6 +50,8 @@ EXCHANGE_SEGMENT = "IDX_I"
 # Token Manager instance (initialized after Telegram setup)
 # This handles automatic token renewal
 token_manager: DhanTokenManager = None
+PENDING_RAILWAY_TOKEN = None
+STATE_FILE = Path(__file__).resolve().parent / "runtime_state.json"
 
 
 def get_dhan_headers() -> dict:
@@ -79,12 +83,88 @@ WARNING_THRESHOLD = 20
 
 # Tracking state for breakout alerts
 class BreakoutState:
-    high_broken = False
-    low_broken = False
-    high_warning_sent = False
-    low_warning_sent = False
-    previous_high = None
-    previous_low = None
+    def __init__(self):
+        self.trade_date = None
+        self.high_broken = False
+        self.low_broken = False
+        self.high_warning_sent = False
+        self.low_warning_sent = False
+        self.previous_high = None
+        self.previous_low = None
+        self.startup_message_sent = False
+
+    def reset_for_date(self, trade_date) -> None:
+        self.trade_date = trade_date.isoformat()
+        self.high_broken = False
+        self.low_broken = False
+        self.high_warning_sent = False
+        self.low_warning_sent = False
+        self.previous_high = None
+        self.previous_low = None
+        self.startup_message_sent = False
+
+    def to_dict(self) -> dict:
+        return {
+            "trade_date": self.trade_date,
+            "high_broken": self.high_broken,
+            "low_broken": self.low_broken,
+            "high_warning_sent": self.high_warning_sent,
+            "low_warning_sent": self.low_warning_sent,
+            "previous_high": self.previous_high,
+            "previous_low": self.previous_low,
+            "startup_message_sent": self.startup_message_sent,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict):
+        state = cls()
+        if not isinstance(payload, dict):
+            return state
+        state.trade_date = payload.get("trade_date")
+        state.high_broken = bool(payload.get("high_broken", False))
+        state.low_broken = bool(payload.get("low_broken", False))
+        state.high_warning_sent = bool(payload.get("high_warning_sent", False))
+        state.low_warning_sent = bool(payload.get("low_warning_sent", False))
+        state.previous_high = payload.get("previous_high")
+        state.previous_low = payload.get("previous_low")
+        state.startup_message_sent = bool(payload.get("startup_message_sent", False))
+        return state
+
+
+def save_breakout_state(state: BreakoutState) -> None:
+    """Persist alert state so same-day restarts do not re-send alerts."""
+    tmp_file = STATE_FILE.with_suffix(".tmp")
+    try:
+        tmp_file.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
+        tmp_file.replace(STATE_FILE)
+    except Exception as exc:
+        print(f"⚠️ Failed to persist runtime state: {exc}")
+
+
+def load_breakout_state(current_date) -> BreakoutState:
+    """Load today's persisted state, or start fresh if unavailable."""
+    fresh_state = BreakoutState()
+    fresh_state.reset_for_date(current_date)
+
+    if not STATE_FILE.exists():
+        return fresh_state
+
+    try:
+        payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"⚠️ Failed to read runtime state, starting fresh: {exc}")
+        return fresh_state
+
+    state = BreakoutState.from_dict(payload)
+    if state.trade_date != current_date.isoformat():
+        return fresh_state
+
+    print(
+        "♻️ Loaded saved state for today: "
+        f"high_broken={state.high_broken}, low_broken={state.low_broken}, "
+        f"high_warning_sent={state.high_warning_sent}, low_warning_sent={state.low_warning_sent}"
+    )
+    return state
 
 
 def validate_dhan_token() -> bool:
@@ -170,6 +250,37 @@ def persist_token_to_railway(new_token: str) -> tuple:
         service_id=RAILWAY_SERVICE_ID,
     )
     return client.upsert_service_variable("DHAN_API_TOKEN", new_token)
+
+
+def persist_token_to_railway_with_market_guard(new_token: str) -> tuple:
+    """Avoid Railway restarts during market hours by deferring token persistence."""
+    global PENDING_RAILWAY_TOKEN
+
+    if is_within_trading_window():
+        PENDING_RAILWAY_TOKEN = new_token
+        return None, "ℹ️ Railway update deferred until market close to avoid a restart during trading hours."
+
+    return persist_token_to_railway(new_token)
+
+
+def flush_pending_railway_token() -> None:
+    """Persist any deferred token once market hours are over."""
+    global PENDING_RAILWAY_TOKEN
+
+    if not PENDING_RAILWAY_TOKEN:
+        return
+
+    persist_ok, persist_error = persist_token_to_railway(PENDING_RAILWAY_TOKEN)
+    if persist_ok:
+        print("✅ Deferred Railway token persistence completed.")
+        send_telegram_message(
+            "✅ <b>Deferred Railway Token Update Completed</b>\n\n"
+            "The renewed DHAN_API_TOKEN was pushed to Railway after market close."
+        )
+        PENDING_RAILWAY_TOKEN = None
+        return
+
+    print(f"⚠️ Deferred Railway token persistence failed: {persist_error}")
 
 
 def get_previous_day_high_low() -> tuple:
@@ -264,13 +375,14 @@ def get_current_ltp() -> float:
         return None
 
 
-def check_breakout(current_price: float, prev_high: float, prev_low: float, state: BreakoutState) -> None:
+def check_breakout(current_price: float, prev_high: float, prev_low: float, state: BreakoutState) -> bool:
     """
     Check if current price has broken previous day's high or low
     Sends Telegram alert on first breakout of the day
     Also sends warning when price is within WARNING_THRESHOLD points
     """
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    state_changed = False
     
     # Calculate distance from high and low
     distance_from_high = prev_high - current_price
@@ -287,6 +399,7 @@ def check_breakout(current_price: float, prev_high: float, prev_low: float, stat
         )
         send_telegram_message(message)
         state.high_warning_sent = True
+        state_changed = True
     
     # Check if approaching low (warning alert)
     if 0 < distance_from_low <= WARNING_THRESHOLD and not state.low_warning_sent and not state.low_broken:
@@ -299,6 +412,7 @@ def check_breakout(current_price: float, prev_high: float, prev_low: float, stat
         )
         send_telegram_message(message)
         state.low_warning_sent = True
+        state_changed = True
     
     # Check if high is broken (only alert once per day)
     if current_price > prev_high and not state.high_broken:
@@ -311,6 +425,7 @@ def check_breakout(current_price: float, prev_high: float, prev_low: float, stat
         )
         send_telegram_message(message)
         state.high_broken = True
+        state_changed = True
         
     # Check if low is broken (only alert once per day)
     if current_price < prev_low and not state.low_broken:
@@ -323,6 +438,69 @@ def check_breakout(current_price: float, prev_high: float, prev_low: float, stat
         )
         send_telegram_message(message)
         state.low_broken = True
+        state_changed = True
+
+    return state_changed
+
+
+def reconcile_state_with_price(current_price: float, prev_high: float, prev_low: float, state: BreakoutState) -> bool:
+    """Mark already-triggered conditions after a restart without sending alerts again."""
+    state_changed = False
+
+    distance_from_high = prev_high - current_price
+    distance_from_low = current_price - prev_low
+
+    if current_price > prev_high and not state.high_broken:
+        state.high_broken = True
+        state.high_warning_sent = True
+        state_changed = True
+        print("♻️ Reconciled state: high breakout had already happened before restart.")
+    elif 0 < distance_from_high <= WARNING_THRESHOLD and not state.high_warning_sent and not state.high_broken:
+        state.high_warning_sent = True
+        state_changed = True
+        print("♻️ Reconciled state: already near previous high on restart.")
+
+    if current_price < prev_low and not state.low_broken:
+        state.low_broken = True
+        state.low_warning_sent = True
+        state_changed = True
+        print("♻️ Reconciled state: low breakout had already happened before restart.")
+    elif 0 < distance_from_low <= WARNING_THRESHOLD and not state.low_warning_sent and not state.low_broken:
+        state.low_warning_sent = True
+        state_changed = True
+        print("♻️ Reconciled state: already near previous low on restart.")
+
+    return state_changed
+
+
+def should_send_startup_message(now: datetime) -> bool:
+    """Only send daily startup notification near the market open."""
+    notification_cutoff = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    return now <= notification_cutoff
+
+
+def maybe_send_startup_message(state: BreakoutState) -> None:
+    """Send the trading-day startup message at most once."""
+    if state.startup_message_sent:
+        return
+
+    now = datetime.now(IST)
+    if not should_send_startup_message(now):
+        print("ℹ️ Skipping startup Telegram message because monitoring resumed after market open.")
+        state.startup_message_sent = True
+        save_breakout_state(state)
+        return
+
+    startup_msg = (
+        f"🟢 <b>Bot Started - NIFTY 50 Monitoring</b>\n\n"
+        f"📊 Previous Day High: <b>{state.previous_high:.2f}</b>\n"
+        f"📊 Previous Day Low: <b>{state.previous_low:.2f}</b>\n"
+        f"📏 Range: <b>{(state.previous_high - state.previous_low):.2f}</b> points\n"
+        f"🕐 Started at: {now.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    send_telegram_message(startup_msg)
+    state.startup_message_sent = True
+    save_breakout_state(state)
 
 
 def is_within_trading_window() -> bool:
@@ -380,7 +558,9 @@ def run_monitor(check_interval: int = 5) -> None:
         client_id=DHAN_CLIENT_ID,
         telegram_notify_func=send_telegram_message,
         renewal_threshold_hours=2.0,  # Renew 2 hours before expiry
-        persist_token_func=persist_token_to_railway if is_railway_persistence_enabled() else None,
+        persist_token_func=(
+            persist_token_to_railway_with_market_guard if is_railway_persistence_enabled() else None
+        ),
     )
     
     # Validate Dhan token
@@ -408,10 +588,11 @@ def run_monitor(check_interval: int = 5) -> None:
         if not renew_ok:
             print(f"⚠️ Forced renewal failed but token still valid: {renew_error}")
 
-    state = BreakoutState()
+    state = load_breakout_state(current_time.date())
     last_token_check = datetime.now(IST)
-    last_date = None
+    last_date = current_time.date()
     was_in_trading_window = False
+    startup_reconciliation_done = False
     
     while True:
         try:
@@ -428,14 +609,11 @@ def run_monitor(check_interval: int = 5) -> None:
             
             # Reset state at the start of each new day
             if last_date != current_date:
-                state.high_broken = False
-                state.low_broken = False
-                state.high_warning_sent = False
-                state.low_warning_sent = False
-                state.previous_high = None
-                state.previous_low = None
+                state.reset_for_date(current_date)
                 last_date = current_date
+                startup_reconciliation_done = False
                 print(f"\n📅 New trading day: {current_date}")
+                save_breakout_state(state)
 
             # Periodic token renewal check (every 30 minutes) even outside trading hours
             if (now - last_token_check).total_seconds() >= 1800:  # 30 minutes
@@ -458,6 +636,7 @@ def run_monitor(check_interval: int = 5) -> None:
             
             # Keep process alive 24x7, but skip market data checks outside the trading window.
             if not in_trading_window:
+                flush_pending_railway_token()
                 time.sleep(60)
                 continue
 
@@ -468,29 +647,31 @@ def run_monitor(check_interval: int = 5) -> None:
                 if prev_high is not None and prev_low is not None:
                     state.previous_high = prev_high
                     state.previous_low = prev_low
-                    
-                    # Send startup message
-                    startup_msg = (
-                        f"🟢 <b>Bot Started - NIFTY 50 Monitoring</b>\n\n"
-                        f"📊 Previous Day High: <b>{prev_high:.2f}</b>\n"
-                        f"📊 Previous Day Low: <b>{prev_low:.2f}</b>\n"
-                        f"📏 Range: <b>{(prev_high - prev_low):.2f}</b> points\n"
-                        f"🕐 Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    )
-                    send_telegram_message(startup_msg)
+                    startup_reconciliation_done = False
+                    save_breakout_state(state)
                 else:
                     print("⏳ Waiting to fetch previous day data...")
                     time.sleep(60)  # Wait 1 minute before retry
                     continue
-            
-            # Get current LTP
+
             current_price = get_current_ltp()
+
+            if current_price is not None and not startup_reconciliation_done:
+                if reconcile_state_with_price(current_price, state.previous_high, state.previous_low, state):
+                    save_breakout_state(state)
+
+                maybe_send_startup_message(state)
+                startup_reconciliation_done = True
             
             if current_price is not None:
-                print(f"💹 NIFTY LTP: {current_price:.2f} | High: {state.previous_high:.2f} | Low: {state.previous_low:.2f} | Time: {datetime.now().strftime('%H:%M:%S')}")
+                print(
+                    f"💹 NIFTY LTP: {current_price:.2f} | High: {state.previous_high:.2f} | "
+                    f"Low: {state.previous_low:.2f} | Time: {datetime.now(IST).strftime('%H:%M:%S')}"
+                )
                 
                 # Check for breakouts
-                check_breakout(current_price, state.previous_high, state.previous_low, state)
+                if check_breakout(current_price, state.previous_high, state.previous_low, state):
+                    save_breakout_state(state)
             
             # Wait before next check
             time.sleep(check_interval)

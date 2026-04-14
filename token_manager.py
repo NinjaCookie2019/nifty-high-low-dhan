@@ -36,7 +36,7 @@ class DhanTokenManager:
         client_id: str,
         telegram_notify_func=None,
         renewal_threshold_hours: float = 2.0,
-        persist_token_func: Optional[Callable[[str], Tuple[bool, Optional[str]]]] = None,
+        persist_token_func: Optional[Callable[[str], Tuple[Optional[bool], Optional[str]]]] = None,
     ):
         """
         Initialize token manager.
@@ -288,6 +288,11 @@ class DhanTokenManager:
             print("✅ Renewed token persisted successfully.")
             return True, None
 
+        if persist_ok is None:
+            info_msg = persist_error or "Token persistence deferred."
+            print(f"ℹ️ {info_msg}")
+            return None, info_msg
+
         error_msg = persist_error or "Unknown token persistence error"
         print(f"⚠️ Token renewed, but persistence failed: {error_msg}")
         return False, error_msg
@@ -331,7 +336,7 @@ class DhanTokenManager:
                 f"🚨 Error: {persist_error}"
             )
         else:
-            persistence_status = "ℹ️ Railway persistence not configured"
+            persistence_status = persist_error or "ℹ️ Railway persistence not configured"
 
         recovery_line = (
             "✅ Recovered from previous renewal failure\n"
