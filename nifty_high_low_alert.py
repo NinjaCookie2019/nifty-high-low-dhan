@@ -145,6 +145,7 @@ def load_breakout_state(current_date) -> BreakoutState:
     """Load today's persisted state, or start fresh if unavailable."""
     fresh_state = BreakoutState()
     fresh_state.reset_for_date(current_date)
+    fresh_state.resumed_from_disk = False
 
     if not STATE_FILE.exists():
         return fresh_state
@@ -157,8 +158,10 @@ def load_breakout_state(current_date) -> BreakoutState:
 
     state = BreakoutState.from_dict(payload)
     if state.trade_date != current_date.isoformat():
+        fresh_state.resumed_from_disk = False
         return fresh_state
 
+    state.resumed_from_disk = True
     print(
         "♻️ Loaded saved state for today: "
         f"high_broken={state.high_broken}, low_broken={state.low_broken}, "
@@ -610,6 +613,7 @@ def run_monitor(check_interval: int = 5) -> None:
             # Reset state at the start of each new day
             if last_date != current_date:
                 state.reset_for_date(current_date)
+                state.resumed_from_disk = False
                 last_date = current_date
                 startup_reconciliation_done = False
                 print(f"\n📅 New trading day: {current_date}")
@@ -657,10 +661,14 @@ def run_monitor(check_interval: int = 5) -> None:
             current_price = get_current_ltp()
 
             if current_price is not None and not startup_reconciliation_done:
-                if reconcile_state_with_price(current_price, state.previous_high, state.previous_low, state):
+                if (
+                    getattr(state, "resumed_from_disk", False)
+                    and reconcile_state_with_price(current_price, state.previous_high, state.previous_low, state)
+                ):
                     save_breakout_state(state)
 
                 maybe_send_startup_message(state)
+                state.resumed_from_disk = False
                 startup_reconciliation_done = True
             
             if current_price is not None:

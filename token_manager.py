@@ -134,7 +134,12 @@ class DhanTokenManager:
         """
         try:
             # Try common formats
-            for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d-%m-%Y %H:%M:%S"]:
+            for fmt in [
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d",
+                "%d-%m-%Y %H:%M:%S",
+                "%d/%m/%Y %H:%M",
+            ]:
                 try:
                     dt = datetime.strptime(validity_str, fmt)
                     self._token_expiry = IST.localize(dt)
