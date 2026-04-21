@@ -45,6 +45,9 @@ RAILWAY_SERVICE_ID=your_railway_service_id
 
 # Optional test switch (set true only when testing renewal flow)
 FORCE_TOKEN_RENEW_ON_START=false
+
+# Optional: points beyond previous high/low required to re-arm repeat breakout alerts
+BREAKOUT_REARM_BUFFER=1
 ```
 
 ### Automatic Railway Token Persistence
@@ -111,7 +114,7 @@ python nifty_high_low_alert.py
 3. **During market hours**: Checks NIFTY LTP every 5 seconds (configurable).
 4. **On token renewal during market hours**: Keeps monitoring with the new token, but waits until after market close before updating Railway.
 5. **On restart**: Reloads saved same-day alert state and reconciles current price so it does not resend old breakout alerts.
-6. **On breakout**: Sends Telegram alert once per day per breakout type.
+6. **On breakout**: Sends Telegram alert, then re-arms after price pulls back through the high/low by `BREAKOUT_REARM_BUFFER` points.
 7. **New day**: Resets state and fetches new previous day data.
 
 ## Sample Alerts

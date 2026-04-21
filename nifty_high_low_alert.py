@@ -78,8 +78,23 @@ def get_dhan_market_headers() -> dict:
         "client-id": DHAN_CLIENT_ID
     }
 
+def parse_float_env(name: str, default: float) -> float:
+    """Read a float env var, falling back safely when it is unset or invalid."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError:
+        print(f"⚠️ Invalid {name}={raw_value!r}; using default {default}")
+        return default
+
+
 # Alert threshold - warn when price is within this many points of high/low
 WARNING_THRESHOLD = 20
+
+# Re-arm breakout alerts only after price pulls back through the level by this many points.
+BREAKOUT_REARM_BUFFER = parse_float_env("BREAKOUT_REARM_BUFFER", 1.0)
 
 # Tracking state for breakout alerts
 class BreakoutState:
@@ -390,6 +405,24 @@ def check_breakout(current_price: float, prev_high: float, prev_low: float, stat
     # Calculate distance from high and low
     distance_from_high = prev_high - current_price
     distance_from_low = current_price - prev_low
+
+    if state.high_broken and current_price <= prev_high - BREAKOUT_REARM_BUFFER:
+        state.high_broken = False
+        state.high_warning_sent = True
+        state_changed = True
+        print(
+            f"🔁 High breakout re-armed after pullback: "
+            f"LTP {current_price:.2f} <= {prev_high - BREAKOUT_REARM_BUFFER:.2f}"
+        )
+
+    if state.low_broken and current_price >= prev_low + BREAKOUT_REARM_BUFFER:
+        state.low_broken = False
+        state.low_warning_sent = True
+        state_changed = True
+        print(
+            f"🔁 Low breakout re-armed after pullback: "
+            f"LTP {current_price:.2f} >= {prev_low + BREAKOUT_REARM_BUFFER:.2f}"
+        )
     
     # Check if approaching high (warning alert)
     if 0 < distance_from_high <= WARNING_THRESHOLD and not state.high_warning_sent and not state.high_broken:
@@ -417,7 +450,7 @@ def check_breakout(current_price: float, prev_high: float, prev_low: float, stat
         state.low_warning_sent = True
         state_changed = True
     
-    # Check if high is broken (only alert once per day)
+    # Check if high is broken (re-arms after price pulls back below the level)
     if current_price > prev_high and not state.high_broken:
         message = (
             f"🚀 <b>NIFTY 50 - HIGH BREAKOUT!</b>\n\n"
@@ -430,7 +463,7 @@ def check_breakout(current_price: float, prev_high: float, prev_low: float, stat
         state.high_broken = True
         state_changed = True
         
-    # Check if low is broken (only alert once per day)
+    # Check if low is broken (re-arms after price bounces back above the level)
     if current_price < prev_low and not state.low_broken:
         message = (
             f"🔻 <b>NIFTY 50 - LOW BREAKOUT!</b>\n\n"
