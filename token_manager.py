@@ -236,13 +236,8 @@ class DhanTokenManager:
                         print(f"   Old token prefix: {old_token_prefix}...")
                         print(f"   New token prefix: {new_token[:10]}...")
 
-                        # Notify via Telegram
-                        self._send_renewal_success_notification(
-                            new_token=new_token,
-                            persist_ok=persist_ok,
-                            persist_error=persist_error,
-                            recovered_from_failure=recovered_from_failure,
-                        )
+                        if persist_ok is False:
+                            self._send_token_persistence_failure_notification(persist_error)
 
                         return True, new_token
                     return self._handle_renewal_failure(
@@ -320,44 +315,21 @@ class DhanTokenManager:
 
         return False, error_msg
 
-    def _send_renewal_success_notification(
+    def _send_token_persistence_failure_notification(
         self,
-        new_token: str,
-        persist_ok: Optional[bool],
         persist_error: Optional[str],
-        recovered_from_failure: bool,
     ) -> None:
-        """Send Telegram notification about token renewal success."""
+        """Send Telegram when token renewal worked but Railway persistence failed."""
         if self._telegram_notify is None:
             return
 
         timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
-        if persist_ok is True:
-            persistence_status = "✅ Railway variable updated (DHAN_API_TOKEN)"
-        elif persist_ok is False:
-            persistence_status = (
-                "⚠️ Token renewed in memory, but Railway update failed.\n"
-                f"🚨 Error: {persist_error}"
-            )
-        else:
-            persistence_status = persist_error or "ℹ️ Railway persistence not configured"
-
-        recovery_line = (
-            "✅ Recovered from previous renewal failure\n"
-            if recovered_from_failure
-            else ""
-        )
-
         message = (
-            f"🔄 <b>Token Renewed Successfully</b>\n\n"
-            f"✅ New token is active\n"
-            f"{recovery_line}"
-            f"{persistence_status}\n"
-            f"📅 Valid for: 24 hours\n"
-            f"🕐 Time: {timestamp}\n\n"
-            f"<i>Token prefix:</i>\n"
-            f"<code>{new_token[:10]}...</code>"
+            f"⚠️ <b>Dhan Token Persistence Failed</b>\n\n"
+            f"Token renewed in memory, but Railway update failed.\n"
+            f"🚨 Error: {persist_error}\n"
+            f"🕐 Time: {timestamp}"
         )
 
         try:

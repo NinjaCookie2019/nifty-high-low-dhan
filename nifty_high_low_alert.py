@@ -291,10 +291,6 @@ def flush_pending_railway_token() -> None:
     persist_ok, persist_error = persist_token_to_railway(PENDING_RAILWAY_TOKEN)
     if persist_ok:
         print("✅ Deferred Railway token persistence completed.")
-        send_telegram_message(
-            "✅ <b>Deferred Railway Token Update Completed</b>\n\n"
-            "The renewed DHAN_API_TOKEN was pushed to Railway after market close."
-        )
         PENDING_RAILWAY_TOKEN = None
         return
 
