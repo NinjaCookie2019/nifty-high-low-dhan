@@ -17,6 +17,7 @@ import pytz
 # Import token manager for automatic token renewal
 from token_manager import DhanTokenManager
 from railway_variable_client import RailwayVariableClient
+from token_storage import load_token, save_token
 
 # Load environment variables
 load_dotenv()
@@ -51,7 +52,9 @@ EXCHANGE_SEGMENT = "IDX_I"
 # This handles automatic token renewal
 token_manager: DhanTokenManager = None
 PENDING_RAILWAY_TOKEN = None
-STATE_FILE = Path(__file__).resolve().parent / "runtime_state.json"
+DATA_DIR = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", str(Path(__file__).resolve().parent)))
+STATE_FILE = DATA_DIR / "runtime_state.json"
+TOKEN_CACHE_FILE = DATA_DIR / "dhan_token.json"
 
 
 def get_dhan_headers() -> dict:
@@ -78,6 +81,19 @@ def get_dhan_market_headers() -> dict:
         "client-id": DHAN_CLIENT_ID
     }
 
+
+def redact_secret_values(text: str) -> str:
+    """Redact configured secrets before writing errors to logs."""
+    redacted = str(text)
+    for secret_name in ("TELEGRAM_BOT_TOKEN", "DHAN_API_TOKEN", "RAILWAY_API_TOKEN"):
+        secret_value = os.getenv(secret_name)
+        if secret_value:
+            redacted = redacted.replace(secret_value, f"[{secret_name}_REDACTED]")
+    if token_manager and token_manager.access_token:
+        redacted = redacted.replace(token_manager.access_token, "[DHAN_TOKEN_REDACTED]")
+    return redacted
+
+
 def parse_float_env(name: str, default: float) -> float:
     """Read a float env var, falling back safely when it is unset or invalid."""
     raw_value = os.getenv(name)
@@ -90,11 +106,27 @@ def parse_float_env(name: str, default: float) -> float:
         return default
 
 
+def parse_int_env(name: str, default: int) -> int:
+    """Read an int env var, falling back safely when it is unset or invalid."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        print(f"⚠️ Invalid {name}={raw_value!r}; using default {default}")
+        return default
+
+
 # Alert threshold - warn when price is within this many points of high/low
 WARNING_THRESHOLD = 20
 
 # Re-arm breakout alerts only after price pulls back through the level by this many points.
 BREAKOUT_REARM_BUFFER = parse_float_env("BREAKOUT_REARM_BUFFER", 1.0)
+
+# Normal token health checks can be infrequent, but renewal retries near expiry must be faster.
+TOKEN_CHECK_INTERVAL_SECONDS = parse_int_env("TOKEN_CHECK_INTERVAL_SECONDS", 1800)
+TOKEN_RENEWAL_RETRY_INTERVAL_SECONDS = parse_int_env("TOKEN_RENEWAL_RETRY_INTERVAL_SECONDS", 300)
 
 # Tracking state for breakout alerts
 class BreakoutState:
@@ -150,6 +182,7 @@ def save_breakout_state(state: BreakoutState) -> None:
     """Persist alert state so same-day restarts do not re-send alerts."""
     tmp_file = STATE_FILE.with_suffix(".tmp")
     try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp_file.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
         tmp_file.replace(STATE_FILE)
     except Exception as exc:
@@ -192,7 +225,7 @@ def validate_dhan_token() -> bool:
     if token_manager:
         is_valid, error = token_manager.validate_token()
         if not is_valid:
-            print("\n⚠️  Your Dhan API token has expired!")
+            print("\n⚠️ Dhan authentication check failed; token expiry or a service outage may be responsible.")
             print("Please generate a new token from: https://web.dhan.co/")
             print("Go to: My Profile → Access DhanHQ APIs → Generate Access Token")
         return is_valid
@@ -207,13 +240,13 @@ def validate_dhan_token() -> bool:
             print(f"📊 Data Plan: {data.get('dataPlan', 'Unknown')}")
             return True
         else:
-            print(f"❌ Token validation failed: {response.text}")
-            print("\n⚠️  Your Dhan API token has expired!")
+            print(f"❌ Token validation failed: {redact_secret_values(response.text)}")
+            print("\n⚠️ Dhan authentication check failed; token expiry or a service outage may be responsible.")
             print("Please generate a new token from: https://web.dhan.co/")
             print("Go to: My Profile → Access DhanHQ APIs → Generate Access Token")
             return False
     except Exception as e:
-        print(f"❌ Error validating token: {e}")
+        print(f"❌ Error validating token: {redact_secret_values(e)}")
         return False
 
 
@@ -228,14 +261,15 @@ def send_telegram_message(message: str) -> bool:
     
     try:
         response = requests.post(url, json=payload, timeout=10)
-        if response.status_code == 200:
-            print(f"✅ Telegram message sent: {message}")
+        body = response.json()
+        if response.status_code == 200 and body.get("ok") is True:
+            print(f"✅ Telegram delivery accepted; message_id={body.get('result', {}).get('message_id')}")
             return True
         else:
-            print(f"❌ Failed to send Telegram message: {response.text}")
+            print(f"❌ Telegram rejected delivery; HTTP {response.status_code}; code={body.get('error_code')}")
             return False
     except Exception as e:
-        print(f"❌ Error sending Telegram message: {e}")
+        print(f"❌ Error sending Telegram message: {redact_secret_values(e)}")
         return False
 
 
@@ -302,7 +336,7 @@ def get_previous_day_high_low() -> tuple:
     Fetch previous trading day's high and low for NIFTY 50
     Returns: (high, low) tuple or (None, None) on failure
     """
-    today = datetime.now()
+    today = datetime.now(IST)
     
     # Calculate previous trading day (skip weekends)
     prev_day = today - timedelta(days=1)
@@ -346,11 +380,11 @@ def get_previous_day_high_low() -> tuple:
                 print(f"❌ No historical data found in response: {data}")
                 return None, None
         else:
-            print(f"❌ Failed to fetch historical data: {response.status_code} - {response.text}")
+            print(f"❌ Failed to fetch historical data: {response.status_code} - {redact_secret_values(response.text)}")
             return None, None
             
     except Exception as e:
-        print(f"❌ Error fetching historical data: {e}")
+        print(f"❌ Error fetching historical data: {redact_secret_values(e)}")
         return None, None
 
 
@@ -381,11 +415,11 @@ def get_current_ltp() -> float:
                 print(f"❌ LTP data not found in response: {data}")
                 return None
         else:
-            print(f"❌ Failed to fetch LTP: {response.status_code} - {response.text}")
+            print(f"❌ Failed to fetch LTP: {response.status_code} - {redact_secret_values(response.text)}")
             return None
             
     except Exception as e:
-        print(f"❌ Error fetching LTP: {e}")
+        print(f"❌ Error fetching LTP: {redact_secret_values(e)}")
         return None
 
 
@@ -429,9 +463,9 @@ def check_breakout(current_price: float, prev_high: float, prev_low: float, stat
             f"📏 Distance: <b>{distance_from_high:.2f}</b> points away\n"
             f"🕐 Time: {timestamp}"
         )
-        send_telegram_message(message)
-        state.high_warning_sent = True
-        state_changed = True
+        if send_telegram_message(message):
+            state.high_warning_sent = True
+            state_changed = True
     
     # Check if approaching low (warning alert)
     if 0 < distance_from_low <= WARNING_THRESHOLD and not state.low_warning_sent and not state.low_broken:
@@ -442,9 +476,9 @@ def check_breakout(current_price: float, prev_high: float, prev_low: float, stat
             f"📏 Distance: <b>{distance_from_low:.2f}</b> points away\n"
             f"🕐 Time: {timestamp}"
         )
-        send_telegram_message(message)
-        state.low_warning_sent = True
-        state_changed = True
+        if send_telegram_message(message):
+            state.low_warning_sent = True
+            state_changed = True
     
     # Check if high is broken (re-arms after price pulls back below the level)
     if current_price > prev_high and not state.high_broken:
@@ -455,9 +489,9 @@ def check_breakout(current_price: float, prev_high: float, prev_low: float, stat
             f"📊 Breakout by: <b>+{(current_price - prev_high):.2f}</b> points\n"
             f"🕐 Time: {timestamp}"
         )
-        send_telegram_message(message)
-        state.high_broken = True
-        state_changed = True
+        if send_telegram_message(message):
+            state.high_broken = True
+            state_changed = True
         
     # Check if low is broken (re-arms after price bounces back above the level)
     if current_price < prev_low and not state.low_broken:
@@ -468,9 +502,9 @@ def check_breakout(current_price: float, prev_high: float, prev_low: float, stat
             f"📊 Breakout by: <b>{(current_price - prev_low):.2f}</b> points\n"
             f"🕐 Time: {timestamp}"
         )
-        send_telegram_message(message)
-        state.low_broken = True
-        state_changed = True
+        if send_telegram_message(message):
+            state.low_broken = True
+            state_changed = True
 
     return state_changed
 
@@ -530,9 +564,9 @@ def maybe_send_startup_message(state: BreakoutState) -> None:
         f"📏 Range: <b>{(state.previous_high - state.previous_low):.2f}</b> points\n"
         f"🕐 Started at: {now.strftime('%Y-%m-%d %H:%M:%S')}"
     )
-    send_telegram_message(startup_msg)
-    state.startup_message_sent = True
-    save_breakout_state(state)
+    if send_telegram_message(startup_msg):
+        state.startup_message_sent = True
+        save_breakout_state(state)
 
 
 def is_within_trading_window() -> bool:
@@ -550,6 +584,25 @@ def is_within_trading_window() -> bool:
     window_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
     
     return window_start <= now <= window_end
+
+
+def wait_for_valid_token() -> None:
+    """Keep failed authentication visible and retry transient outages instead of exiting 0."""
+    notified = False
+    while not validate_dhan_token():
+        if not notified:
+            notified = send_telegram_message(
+                "🛑 <b>NIFTY monitoring paused</b>\nDhan authentication failed. "
+                "The worker is retrying every 60 seconds. If the token has expired, "
+                "update DHAN_API_TOKEN in Railway; an expired token cannot be renewed."
+            )
+        print("HEALTH: waiting_for_dhan_auth; price monitoring unavailable; retry in 60s", flush=True)
+        time.sleep(60)
+    ok, error = save_token(TOKEN_CACHE_FILE, token_manager.access_token, DHAN_CLIENT_ID)
+    if not ok:
+        raise RuntimeError(error)
+    if notified:
+        send_telegram_message("🟢 <b>Dhan authentication recovered</b>\nNIFTY monitoring can resume.")
 
 
 def run_monitor(check_interval: int = 5) -> None:
@@ -573,32 +626,23 @@ def run_monitor(check_interval: int = 5) -> None:
         print("  - DHAN_CLIENT_ID")
         print("  - TELEGRAM_BOT_TOKEN")
         print("  - TELEGRAM_CHAT_ID")
-        return
+        raise SystemExit(1)
 
-    if is_railway_persistence_enabled():
-        print("✅ Railway token persistence is enabled.")
-    else:
-        missing_vars = get_missing_railway_persistence_vars()
-        print("⚠️ Railway token persistence is disabled.")
-        print(f"   Missing env vars: {', '.join(missing_vars)}")
-        print("   Bot will run, but post-restart token may require manual update.")
+    print("✅ Renewed token and alert state use persistent storage." if os.getenv("RAILWAY_VOLUME_MOUNT_PATH") else "⚠️ No persistent volume; token cache is local only.")
 
     # Initialize Token Manager with Telegram notification capability
     global token_manager
     token_manager = DhanTokenManager(
-        access_token=DHAN_API_TOKEN,
+        access_token=load_token(TOKEN_CACHE_FILE, DHAN_API_TOKEN, DHAN_CLIENT_ID),
         client_id=DHAN_CLIENT_ID,
         telegram_notify_func=send_telegram_message,
         renewal_threshold_hours=2.0,  # Renew 2 hours before expiry
-        persist_token_func=(
-            persist_token_to_railway_with_market_guard if is_railway_persistence_enabled() else None
-        ),
+        persist_token_func=lambda token: save_token(TOKEN_CACHE_FILE, token, DHAN_CLIENT_ID),
     )
     
     # Validate Dhan token
     print("\n🔐 Validating Dhan API token...")
-    if not validate_dhan_token():
-        return
+    wait_for_valid_token()
 
     # Optional manual test switch: force token renewal immediately on startup.
     # Useful to verify end-to-end renewal + Railway persistence without waiting.
@@ -620,8 +664,9 @@ def run_monitor(check_interval: int = 5) -> None:
         if not renew_ok:
             print(f"⚠️ Forced renewal failed but token still valid: {renew_error}")
 
+    current_time = datetime.now(IST)
     state = load_breakout_state(current_time.date())
-    last_token_check = datetime.now(IST)
+    last_token_check = datetime.now(IST) - timedelta(seconds=TOKEN_CHECK_INTERVAL_SECONDS)
     last_date = current_time.date()
     was_in_trading_window = False
     startup_reconciliation_done = False
@@ -648,28 +693,42 @@ def run_monitor(check_interval: int = 5) -> None:
                 print(f"\n📅 New trading day: {current_date}")
                 save_breakout_state(state)
 
-            # Periodic token renewal check (every 30 minutes) even outside trading hours
-            if (now - last_token_check).total_seconds() >= 1800:  # 30 minutes
+            # Periodic token renewal check even outside trading hours.
+            # Once a token enters the renewal window, retry faster so a transient network
+            # outage near market open does not burn the remaining validity window.
+            token_check_interval = TOKEN_CHECK_INTERVAL_SECONDS
+            if token_manager and token_manager.should_renew():
+                token_check_interval = TOKEN_RENEWAL_RETRY_INTERVAL_SECONDS
+
+            if (now - last_token_check).total_seconds() >= token_check_interval:
                 last_token_check = now
                 if token_manager and token_manager.should_renew():
                     print("🔄 Token renewal check triggered...")
                     if not token_manager.check_and_renew_if_needed():
-                        print("🛑 Token expired and renewal failed. Stopping bot.")
+                        print("🛑 Token expired; monitoring paused until authentication recovers.")
                         send_telegram_message(
-                            "🛑 <b>Bot Stopped - Dhan Token Expired</b>\n\n"
+                            "🛑 <b>Monitoring Paused - Dhan Token Expired</b>\n\n"
                             "Renewal failed after token expiry.\n"
-                            "Please verify Dhan token and Railway persistence configuration."
+                            "Please update the expired Dhan token in Railway."
                         )
-                        sys.exit(1)
+                        wait_for_valid_token()
+                        last_token_check = datetime.now(IST)
+                        continue  # Recompute the date and market window after recovery.
                 else:
+                    if token_manager and not validate_dhan_token():
+                        wait_for_valid_token()
+                        last_token_check = datetime.now(IST)
+                        continue
                     # Log token status periodically
                     time_remaining = token_manager.get_time_until_expiry() if token_manager else None
                     if time_remaining:
                         print(f"🔑 Token status: {time_remaining} until expiry")
             
+            if token_manager.last_persist_ok is False:
+                token_manager.retry_persistence()
+
             # Keep process alive 24x7, but skip market data checks outside the trading window.
             if not in_trading_window:
-                flush_pending_railway_token()
                 time.sleep(60)
                 continue
 
@@ -690,17 +749,11 @@ def run_monitor(check_interval: int = 5) -> None:
             current_price = get_current_ltp()
 
             if current_price is not None and not startup_reconciliation_done:
-                if (
-                    getattr(state, "resumed_from_disk", False)
-                    and reconcile_state_with_price(current_price, state.previous_high, state.previous_low, state)
-                ):
-                    save_breakout_state(state)
-
-                maybe_send_startup_message(state)
                 state.resumed_from_disk = False
                 startup_reconciliation_done = True
             
             if current_price is not None:
+                maybe_send_startup_message(state)
                 print(
                     f"💹 NIFTY LTP: {current_price:.2f} | High: {state.previous_high:.2f} | "
                     f"Low: {state.previous_low:.2f} | Time: {datetime.now(IST).strftime('%H:%M:%S')}"
@@ -718,7 +771,7 @@ def run_monitor(check_interval: int = 5) -> None:
             send_telegram_message("🔴 <b>Bot Stopped</b>\nNIFTY 50 monitoring has been stopped.")
             break
         except Exception as e:
-            print(f"❌ Unexpected error: {e}")
+            print(f"❌ Unexpected error: {redact_secret_values(e)}")
             time.sleep(30)  # Wait before retry on error
 
 

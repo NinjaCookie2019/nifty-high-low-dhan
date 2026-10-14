@@ -10,7 +10,7 @@ A Python script that monitors NIFTY 50 index and sends Telegram alerts when the 
 - 🕐 Automatically detects market hours (9:15 AM - 3:30 PM IST)
 - 📅 Resets alerts at the start of each trading day
 - ♻️ Restores same-day alert state after a restart to avoid duplicate breakout alerts
-- ⏳ Defers Railway token persistence until after market hours to avoid mid-session restarts
+- 🔐 Saves renewed tokens to a persistent volume without restarting the worker
 - ⚡ Configurable check interval
 
 ## Prerequisites
@@ -37,7 +37,7 @@ DHAN_CLIENT_ID=your_dhan_client_id
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_telegram_chat_id
 
-# Optional but recommended for automatic token persistence in Railway
+# Legacy variables (no longer required with a persistent volume)
 RAILWAY_API_TOKEN=your_railway_api_token
 RAILWAY_PROJECT_ID=your_railway_project_id
 RAILWAY_ENVIRONMENT_ID=your_railway_environment_id
@@ -50,32 +50,26 @@ FORCE_TOKEN_RENEW_ON_START=false
 BREAKOUT_REARM_BUFFER=1
 ```
 
-### Automatic Railway Token Persistence
+### Durable token storage and recovery
 
-If Railway variables above are configured, the bot will automatically:
+Mount a Railway volume at `/data`. The worker uses `RAILWAY_VOLUME_MOUNT_PATH`
+for its renewed Dhan token (owner-only file permissions) and daily alert state.
+The newer of the cached token and `DHAN_API_TOKEN` is selected at startup, then
+validated with Dhan. Each renewed token is saved immediately, before the next
+profile request. Renewal no longer updates Railway variables or triggers a deploy.
+The legacy `RAILWAY_API_TOKEN` is not needed by the worker.
 
-1. Renew `DHAN_API_TOKEN` before expiry.
-2. Keep the renewed token active in memory immediately.
-3. Defer updating Railway service variable `DHAN_API_TOKEN` until after market hours, so Railway does not restart the worker mid-session.
-4. Continue running even if persistence fails (in-memory token remains active for current process).
-5. Restore same-day alert flags on restart so startup/high/low alerts are not duplicated.
-6. Send Telegram warnings for renewal/persistence failures and a critical alert if token expires.
+Authentication failures pause price monitoring, send an operational Telegram
+warning, and retry every 60 seconds. An expired token cannot be renewed: generate
+a fresh token in Dhan, update `DHAN_API_TOKEN` in Railway, and redeploy. Missing
+required configuration exits nonzero. Telegram alert flags are persisted only
+after Telegram accepts the message, so rejected deliveries remain retryable.
 
-This ensures Railway gets the latest token without interrupting live market monitoring.
-
-Security guidance:
-- Use a scoped Railway API token with minimum required permissions.
-- Never log or share the full Dhan/Railway token values.
-- Rotate Railway API token periodically.
-
-### Test Renewal Immediately (without waiting)
-
-To verify renewal + Railway persistence right now:
-
-1. Set `FORCE_TOKEN_RENEW_ON_START=true` in Railway variables.
-2. Deploy/restart the service once.
-3. Check Telegram and logs for forced-renew success and Railway update.
-4. Set `FORCE_TOKEN_RENEW_ON_START=false` after test (important).
+Run `python verify_delivery.py` in the deployed container to send two clearly
+labelled synthetic high/low tests through the production alert function. This does
+not modify the live worker's alert state. Run with `--market-data` to additionally
+validate Dhan authentication, historical levels and the latest price. Telegram
+acceptance confirms delivery to the chat API, not that a person read the message.
 
 ### Getting Telegram Chat ID
 
@@ -112,8 +106,8 @@ python nifty_high_low_alert.py
 1. **Runs continuously (24x7)**: Process stays alive on Railway.
 2. **Outside market hours**: Bot sleeps and only performs periodic token health checks.
 3. **During market hours**: Checks NIFTY LTP every 5 seconds (configurable).
-4. **On token renewal during market hours**: Keeps monitoring with the new token, but waits until after market close before updating Railway.
-5. **On restart**: Reloads saved same-day alert state and reconciles current price so it does not resend old breakout alerts.
+4. **On token renewal**: Saves the new token on the persistent volume immediately, without redeploying.
+5. **On restart**: Reloads successfully delivered same-day alert state; failed sends remain retryable.
 6. **On breakout**: Sends Telegram alert, then re-arms after price pulls back through the high/low by `BREAKOUT_REARM_BUFFER` points.
 7. **New day**: Resets state and fetches new previous day data.
 

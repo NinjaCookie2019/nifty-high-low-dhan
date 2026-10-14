@@ -9,6 +9,7 @@ from typing import Callable, Optional, Tuple
 
 import pytz
 import requests
+from token_storage import token_expiry
 
 # Indian timezone
 IST = pytz.timezone('Asia/Kolkata')
@@ -118,12 +119,12 @@ class DhanTokenManager:
                 print(f"📊 Data Plan: {data.get('dataPlan', 'Unknown')}")
                 return True, None
             else:
-                error_msg = f"Token validation failed: {response.text}"
+                error_msg = f"Dhan authentication failed (HTTP {response.status_code})"
                 print(f"❌ {error_msg}")
                 return False, error_msg
                 
         except Exception as e:
-            error_msg = f"Error validating token: {e}"
+            error_msg = f"Dhan validation request failed ({type(e).__name__})"
             print(f"❌ {error_msg}")
             return False, error_msg
     
@@ -133,6 +134,16 @@ class DhanTokenManager:
         Dhan returns format like: "2024-12-28 10:30:00"
         """
         try:
+            expiry = token_expiry(self._access_token)
+            if expiry:
+                self._token_expiry = datetime.fromtimestamp(expiry, IST)
+                return
+            try:
+                dt = datetime.fromisoformat(validity_str.replace("Z", "+00:00"))
+                self._token_expiry = dt.astimezone(IST) if dt.tzinfo else IST.localize(dt)
+                return
+            except (ValueError, TypeError, AttributeError):
+                pass
             # Try common formats
             for fmt in [
                 "%Y-%m-%d %H:%M:%S",
@@ -219,25 +230,22 @@ class DhanTokenManager:
                 )
 
                 if new_token:
-                    old_token_prefix = self._access_token[:10] if self._access_token else "N/A"
                     self._access_token = new_token
+                    # Renewal invalidates the old token. Save the replacement immediately,
+                    # even if the following profile request experiences a transient outage.
+                    persist_ok, persist_error = self._persist_renewed_token(new_token)
+                    self._parse_token_expiry(data.get("expiryTime", ""))
+                    if persist_ok is False:
+                        self._send_token_persistence_failure_notification(persist_error)
 
                     # Validate the new token to get expiry
                     is_valid, validation_error = self.validate_token()
 
                     if is_valid:
-                        recovered_from_failure = self._last_renewal_failed
                         self._last_renewal_failed = False
                         self._token_expired_alert_sent = False
 
-                        persist_ok, persist_error = self._persist_renewed_token(new_token)
-
-                        print(f"✅ Token renewed successfully!")
-                        print(f"   Old token prefix: {old_token_prefix}...")
-                        print(f"   New token prefix: {new_token[:10]}...")
-
-                        if persist_ok is False:
-                            self._send_token_persistence_failure_notification(persist_error)
+                        print("✅ Token renewed successfully!")
 
                         return True, new_token
                     return self._handle_renewal_failure(
@@ -248,11 +256,11 @@ class DhanTokenManager:
                     error_msg = f"No token in renewal response: {safe_payload}"
                     return self._handle_renewal_failure(error_msg)
             else:
-                error_msg = f"Token renewal failed: {response.status_code} - {response.text}"
+                error_msg = f"Token renewal failed (HTTP {response.status_code})"
                 return self._handle_renewal_failure(error_msg)
 
         except Exception as e:
-            error_msg = f"Error renewing token: {e}"
+            error_msg = f"Token renewal request failed ({type(e).__name__})"
             return self._handle_renewal_failure(error_msg)
 
     def _sanitize_payload(self, payload: dict) -> dict:
@@ -265,7 +273,7 @@ class DhanTokenManager:
             lowered = str(key).lower()
             if "token" in lowered:
                 token_value = str(value) if value is not None else ""
-                safe_payload[key] = f"{token_value[:10]}..." if token_value else "REDACTED"
+                safe_payload[key] = "REDACTED"
             else:
                 safe_payload[key] = value
         return safe_payload
@@ -297,6 +305,10 @@ class DhanTokenManager:
         print(f"⚠️ Token renewed, but persistence failed: {error_msg}")
         return False, error_msg
 
+    def retry_persistence(self):
+        """Retry durable storage without invalidating the active token again."""
+        return self._persist_renewed_token(self._access_token)
+
     def _handle_renewal_failure(self, error_msg: str) -> Tuple[bool, Optional[str]]:
         """Handle failed renewal with transition-aware notifications."""
         print(f"❌ {error_msg}")
@@ -326,8 +338,8 @@ class DhanTokenManager:
         timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
         message = (
-            f"⚠️ <b>Dhan Token Persistence Failed</b>\n\n"
-            f"Token renewed in memory, but Railway update failed.\n"
+            f"⚠️ <b>Dhan Token Storage Failed</b>\n\n"
+            f"Token renewed in memory, but durable storage failed.\n"
             f"🚨 Error: {persist_error}\n"
             f"🕐 Time: {timestamp}"
         )
@@ -364,7 +376,7 @@ class DhanTokenManager:
             f"🛑 <b>Dhan Token Expired</b>\n\n"
             f"❌ Renewal failed after expiry.\n"
             f"🚨 Error: {error}\n"
-            f"⚠️ Bot will stop until token is fixed.\n"
+            f"⚠️ Monitoring is paused until token is fixed.\n"
             f"🕐 Time: {timestamp}"
         )
         try:
@@ -401,7 +413,7 @@ class DhanTokenManager:
         time_remaining = self.get_time_until_expiry()
 
         return {
-            "token_prefix": self._access_token[:10] + "..." if self._access_token else None,
+            "token_configured": bool(self._access_token),
             "client_id": self._client_id,
             "expiry": self._token_expiry.isoformat() if self._token_expiry else None,
             "time_remaining": str(time_remaining) if time_remaining else None,
